@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LED Matrix</title>
+<style>
+  body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em}
+  input{width:100%;padding:.7em;font-size:1.1em;box-sizing:border-box;margin-bottom:.6em}
+  button{padding:.7em 1.4em;font-size:1.1em}
+  small{color:#666} #status{min-height:1.4em}
+</style></head><body>
+<h2>LED Matrix</h2>
+<form id="f">
+  <input id="text" type="text" maxlength="100" placeholder="Type something..." autofocus required>
+  <input id="pw" type="password" placeholder="Password" autocomplete="current-password" required>
+  <button type="submit">Show on matrix</button>
+</form>
+<p id="status"></p>
+<p>Now showing: <b id="now">...</b></p>
+<small>Long text scrolls and loops. Letters, numbers and basic symbols only. The matrix updates within a few seconds.</small>
+<script>
+const $ = id => document.getElementById(id);
+$('pw').value = localStorage.getItem('pw') || '';
+async function refresh() {
+  try { $('now').textContent = (await (await fetch('/api/message')).json()).text || '(nothing yet)'; } catch (e) {}
+}
+$('f').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('status').textContent = 'Sending...';
+  const r = await fetch('/api/message', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: $('text').value, password: $('pw').value})
+  });
+  const j = await r.json();
+  if (r.ok) {
+    localStorage.setItem('pw', $('pw').value);
+    $('text').value = '';
+    $('status').textContent = 'Sent!';
+    refresh();
+  } else {
+    $('status').textContent = j.error || 'Failed';
+  }
+});
+refresh();
+</script>
+</body></html>
