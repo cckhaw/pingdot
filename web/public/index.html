@@ -48,6 +48,7 @@
   #status{min-height:1.4em;margin:.8em 0 0;color:var(--muted)} #status.err{color:var(--err)}
   .now{margin-top:1em;padding:.8em;border-radius:8px;background:#000;color:#00c8ff;
        font-family:monospace;font-size:1.1em;word-break:break-word}
+  .reason{font-size:.85em;color:var(--err);margin:.2em 0 0}
   small{color:var(--muted)} [hidden]{display:none!important}
 </style></head><body>
 <main>
@@ -93,6 +94,7 @@
     <p style="margin:.8em 0 0;text-align:right"><button type="button" class="link" id="logout">Sign out</button></p>
   </form>
 
+  <p id="reason" class="reason" hidden></p>
   <p id="status" role="status"></p>
   <div class="now" id="now" hidden></div>
   <p><small>Long text scrolls and loops. Letters, numbers and basic symbols only.</small></p>
@@ -140,7 +142,8 @@ async function refresh() {
     if (status === 401) { showApp(false); return; }
     $('device').classList.toggle('on', !!m.online);
     $('deviceText').textContent = m.online ? 'Device online' : 'Device offline';
-    $('device').title = m.online ? '' : (m.reason || '');
+    $('reason').hidden = !!m.online || !m.reason;
+    $('reason').textContent = m.reason ? 'Why: ' + m.reason : '';
     if (m.online && m.text) showNow(m.text, m.color);
   } catch (e) {}
 }
