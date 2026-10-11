@@ -1,23 +1,19 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPSServer.hpp>      // library: "ESP32 HTTPS Server" by Frank Hessel
-#include <SSLCert.hpp>
-#include <HTTPRequest.hpp>
-#include <HTTPResponse.hpp>
-#include <ResourceNode.hpp>
+#include <esp_random.h>
+#include <mbedtls/gcm.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
-#include "cert.h"                // made by tools/gen-cert.sh (certificate + private key)
-
-using namespace httpsserver;
 
 // ---------- CHANGE THESE ----------
 const char* WIFI_SSID     = "YOUR_WIFI_NAME";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 const char* HOSTNAME      = "ledmatrix";
-const int   HTTPS_PORT    = 8443;            // forward this port on your router to the ESP32
-const char* DEVICE_SECRET = "CHANGE-ME-LONG-RANDOM-STRING";   // must equal DEVICE_SECRET on Vercel
+const int   TCP_PORT      = 8443;            // forward this port on your router to the ESP32
+// 64 hex characters (32 bytes). Make one with:  openssl rand -hex 32
+// Must be identical to DEVICE_KEY on Vercel. It both authenticates and encrypts.
+const char* DEVICE_KEY    = "PASTE-64-HEX-CHARACTERS-HERE";
 // ----------------------------------
 
 #define LED_PIN       16
@@ -47,8 +43,15 @@ String currentColorHex = "00c8ff";
 int authFailures = 0;
 unsigned long lockedUntil = 0;
 
-SSLCert cert = SSLCert(cert_der, cert_der_len, key_der, key_der_len);
-HTTPSServer secureServer = HTTPSServer(&cert, HTTPS_PORT, 2);   // max 2 connections
+WiFiServer tcpServer(TCP_PORT);
+WiFiClient client;
+bool clientActive = false;
+unsigned long clientSince = 0;
+uint8_t key[32];
+uint8_t challenge[16];
+const size_t MAX_FRAME = 256;
+uint8_t rx[2 + MAX_FRAME];
+size_t rxLen = 0;
 
 // ---------- Songs (non-blocking; order must match the website's dropdown) ----------
 
@@ -150,68 +153,125 @@ void updateScrolling() {
   }
 }
 
-// ---------- Incoming requests (HTTPS, from the Vercel site) ----------
+// ---------- Incoming messages (encrypted TCP) ----------
+//
+// Protocol (the Vercel site is the client):
+//   ESP32 -> site : 16 random bytes (challenge, new for every connection)
+//   site -> ESP32 : [2-byte length][12-byte IV | AES-256-GCM ciphertext | 16-byte tag]
+//                   key = DEVICE_KEY, AAD = challenge  (so recorded requests can't be replayed)
+//   ESP32 -> site : same framing, AAD = challenge + "R"
+// Requests: "M\n<RRGGBB>\n<song>\n<text>" shows a message, "S" asks for the current status.
 
-bool secretMatches(const std::string& given) {
-  size_t n = strlen(DEVICE_SECRET);
-  uint8_t diff = (given.size() != n);
-  for (size_t i = 0; i < n; i++) diff |= (i < given.size() ? given[i] : 0) ^ DEVICE_SECRET[i];
-  return diff == 0;
-}
-
-// Checks the X-Auth header. 5 wrong tries in a row lock requests out for a minute.
-bool authorized(HTTPRequest* req, HTTPResponse* res) {
-  if (millis() < lockedUntil) {
-    res->setStatusCode(429);
-    res->print("locked");
-    return false;
+bool parseKey() {
+  if (strlen(DEVICE_KEY) != 64) return false;
+  for (int i = 0; i < 32; i++) {
+    char h[3] = { DEVICE_KEY[2 * i], DEVICE_KEY[2 * i + 1], 0 };
+    char* end;
+    key[i] = (uint8_t)strtol(h, &end, 16);
+    if (*end) return false;
   }
-  if (!secretMatches(req->getHeader("X-Auth"))) {
-    if (++authFailures >= 5) { lockedUntil = millis() + 60000; authFailures = 0; }
-    res->setStatusCode(401);
-    res->print("unauthorized");
-    return false;
-  }
-  authFailures = 0;
   return true;
 }
 
-// POST /message, body "<RRGGBB>\n<song>\n<text>"
-void handleMessage(HTTPRequest* req, HTTPResponse* res) {
-  if (!authorized(req, res)) return;
-
-  char buf[256];
-  size_t len = 0;
-  while (!req->requestComplete() && len < sizeof(buf) - 1) {
-    len += req->readBytes((byte*)buf + len, sizeof(buf) - 1 - len);
-  }
-  if (!req->requestComplete()) { res->setStatusCode(413); res->print("too big"); return; }
-  buf[len] = 0;
-
-  String body(buf);
-  int a = body.indexOf('\n');
-  int b = body.indexOf('\n', a + 1);
-  if (a != 6 || b < 0) { res->setStatusCode(400); res->print("bad format"); return; }
-
-  String hex  = body.substring(0, a);
-  int    song = body.substring(a + 1, b).toInt();
-  String text = body.substring(b + 1);
-
-  long rgb = strtol(hex.c_str(), nullptr, 16);
-  uint16_t color = matrix.Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
-  if (!setText(text, color)) { res->setStatusCode(400); res->print("empty text"); return; }
-  currentColorHex = hex;
-  startSong(song);
-  res->print("ok");
+void closeClient() {
+  client.stop();
+  clientActive = false;
+  rxLen = 0;
 }
 
-// GET /status -> "<RRGGBB>\n<current text>"  (also how the site checks we're online)
-void handleStatus(HTTPRequest* req, HTTPResponse* res) {
-  if (!authorized(req, res)) return;
-  res->setHeader("Content-Type", "text/plain");
-  res->print(currentColorHex.c_str());
-  res->print("\n");
-  res->print(currentText.c_str());
+void authFailed() {
+  if (++authFailures >= 5) { lockedUntil = millis() + 60000; authFailures = 0; }   // 5 bad tries: ignore everyone for 1 min
+  closeClient();
+}
+
+// Returns the reply text for a decrypted request.
+String handleRequest(const String& req) {
+  if (req == "S") return currentColorHex + "\n" + currentText;
+
+  if (req.startsWith("M\n") && req.length() > 9 && req[8] == '\n') {
+    String hex = req.substring(2, 8);
+    int b = req.indexOf('\n', 9);
+    if (b < 0) return "ERR";
+    int song = req.substring(9, b).toInt();
+    String text = req.substring(b + 1);
+
+    long rgb = strtol(hex.c_str(), nullptr, 16);
+    uint16_t color = matrix.Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+    if (!setText(text, color)) return "ERR";
+    currentColorHex = hex;
+    startSong(song);
+    return "OK";
+  }
+  return "ERR";
+}
+
+void sendReply(const String& reply) {
+  uint8_t out[2 + 12 + 160 + 16];
+  size_t n = min((size_t)reply.length(), (size_t)160);
+  uint8_t aad[17];
+  memcpy(aad, challenge, 16);
+  aad[16] = 'R';
+
+  uint8_t* frame = out + 2;
+  esp_fill_random(frame, 12);                                   // fresh IV
+  mbedtls_gcm_context g;
+  mbedtls_gcm_init(&g);
+  mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
+  mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, n, frame, 12, aad, sizeof(aad),
+                            (const uint8_t*)reply.c_str(), frame + 12, 16, frame + 12 + n);
+  mbedtls_gcm_free(&g);
+
+  size_t frameLen = 12 + n + 16;
+  out[0] = frameLen >> 8;
+  out[1] = frameLen & 0xFF;
+  client.write(out, 2 + frameLen);
+  client.flush();
+}
+
+void processFrame(const uint8_t* f, size_t n) {
+  size_t ptLen = n - 12 - 16;
+  uint8_t pt[MAX_FRAME];
+  mbedtls_gcm_context g;
+  mbedtls_gcm_init(&g);
+  mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
+  int ret = mbedtls_gcm_auth_decrypt(&g, ptLen, f, 12, challenge, sizeof(challenge),
+                                     f + n - 16, 16, f + 12, pt);
+  mbedtls_gcm_free(&g);
+  if (ret != 0) { authFailed(); return; }                       // wrong key or tampered/replayed
+
+  authFailures = 0;
+  pt[ptLen] = 0;
+  sendReply(handleRequest(String((const char*)pt)));
+  closeClient();
+}
+
+// Called every loop(); never blocks.
+void serviceNetwork() {
+  WiFiClient incoming = tcpServer.available();
+  if (incoming) {
+    if (millis() < lockedUntil) {
+      incoming.stop();
+    } else {
+      if (clientActive) closeClient();                          // newest connection wins
+      client = incoming;
+      client.setNoDelay(true);
+      esp_fill_random(challenge, sizeof(challenge));
+      client.write(challenge, sizeof(challenge));
+      clientActive = true;
+      clientSince = millis();
+      rxLen = 0;
+    }
+  }
+  if (!clientActive) return;
+
+  if (millis() - clientSince > 5000 || !client.connected()) { closeClient(); return; }
+
+  while (client.available() && rxLen < sizeof(rx)) rx[rxLen++] = client.read();
+  if (rxLen < 2) return;
+
+  size_t n = ((size_t)rx[0] << 8) | rx[1];
+  if (n < 12 + 16 + 1 || n > MAX_FRAME - 1) { authFailed(); return; }   // malformed
+  if (rxLen >= 2 + n) processFrame(rx + 2, n);
 }
 
 // ---------- Setup / loop ----------
@@ -229,25 +289,29 @@ void setup() {
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  if (!parseKey()) {
+    Serial.println("DEVICE_KEY must be exactly 64 hex characters");
+    setText("BAD KEY", matrix.Color(255, 0, 0));
+    while (true) delay(1000);
+  }
 }
 
 void loop() {
   bool connected = (WiFi.status() == WL_CONNECTED);
 
   if (connected && !wasConnected) {
-    Serial.println("Connected, LAN IP " + WiFi.localIP().toString() + ", HTTPS port " + String(HTTPS_PORT));
+    Serial.println("Connected, LAN IP " + WiFi.localIP().toString() + ", port " + String(TCP_PORT));
     setText("Online", DEFAULT_COLOR());
     currentColorHex = "00c8ff";
     if (!serverStarted) {        // start only once WiFi is up
-      secureServer.registerNode(new ResourceNode("/message", "POST", &handleMessage));
-      secureServer.registerNode(new ResourceNode("/status", "GET", &handleStatus));
-      secureServer.start();
+      tcpServer.begin();
       serverStarted = true;
     }
   }
   wasConnected = connected;
 
-  if (serverStarted) secureServer.loop();
+  if (serverStarted) serviceNetwork();
   updateScrolling();
   updateSong();
 }

@@ -1,7 +1,7 @@
 const { callDevice, clean, cleanColor, cleanSong } = require('./_device');
 const { isAuthed } = require('./_auth');
 
-// POST {text, color, song}: log-in required; pushed straight to the ESP32 over HTTPS.
+// POST {text, color, song}: log-in required; pushed straight to the ESP32 over an encrypted TCP socket.
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if (req.method !== 'POST') {
@@ -20,12 +20,10 @@ module.exports = async (req, res) => {
   const song = cleanSong(body.song);
 
   try {
-    const r = await callDevice('POST', '/message', `${color.slice(1)}\n${song}\n${text}`);
-    if (r.status === 200) return res.status(200).json({ ok: true, text, color, song });
-    if (r.status === 401) return res.status(502).json({ error: 'Device rejected the secret (check DEVICE_SECRET)' });
-    if (r.status === 429) return res.status(502).json({ error: 'Device is temporarily locked, try again in a minute' });
-    return res.status(502).json({ error: `Device error (${r.status})` });
+    const r = await callDevice(`M\n${color.slice(1)}\n${song}\n${text}`);
+    if (r === 'OK') return res.status(200).json({ ok: true, text, color, song });
+    return res.status(502).json({ error: 'Device refused the message' });
   } catch (e) {
-    return res.status(502).json({ error: 'Device unreachable' });
+    return res.status(502).json({ error: e.message === 'Device is not configured' ? e.message : 'Device unreachable' });
   }
 };

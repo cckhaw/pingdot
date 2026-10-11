@@ -1,5 +1,3 @@
 node_modules/
 .vercel/
 .env*
-firmware/ledmatrix/cert.h
-tools/device-cert.pem
