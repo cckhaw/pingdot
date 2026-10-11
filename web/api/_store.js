@@ -5,7 +5,10 @@ const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TO
 
 const redis = new Redis({ url, token });
 const KEY = 'ledmatrix:message';
+const SEEN_KEY = 'ledmatrix:lastSeen';
 const MAX_TEXT_LEN = 100;
+const SONG_COUNT = 6;            // 0 = none; keep in sync with the firmware and index.html
+const DEFAULT_COLOR = '#00c8ff';
 
 // Printable ASCII only (the matrix font has nothing else), same as the firmware.
 function clean(t) {
@@ -18,15 +21,33 @@ function clean(t) {
   return out.trim();
 }
 
-async function getMessage() {
-  const m = await redis.get(KEY);
-  return m || { id: 0, text: '' };
+function cleanColor(c) {
+  return /^#[0-9a-fA-F]{6}$/.test(String(c)) ? String(c).toLowerCase() : DEFAULT_COLOR;
 }
 
-async function setMessage(text) {
-  const msg = { id: Date.now(), text };
+function cleanSong(s) {
+  const n = Number.parseInt(s, 10);
+  return Number.isInteger(n) && n >= 0 && n < SONG_COUNT ? n : 0;
+}
+
+// One Redis command: message + the device's last heartbeat.
+async function getState() {
+  const [m, seen] = await redis.mget(KEY, SEEN_KEY);
+  const message = m || { id: 0, text: '' };
+  return {
+    message: { color: DEFAULT_COLOR, song: 0, ...message },
+    lastSeen: Number(seen) || 0,
+  };
+}
+
+async function setMessage({ text, color, song }) {
+  const msg = { id: Date.now(), text, color, song };
   await redis.set(KEY, msg);
   return msg;
 }
 
-module.exports = { getMessage, setMessage, clean };
+async function touchDevice() {
+  await redis.set(SEEN_KEY, Date.now(), { ex: 3600 });
+}
+
+module.exports = { getState, setMessage, touchDevice, clean, cleanColor, cleanSong };

@@ -2,46 +2,171 @@
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>LED Matrix</title>
 <style>
-  body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em}
-  input{width:100%;padding:.7em;font-size:1.1em;box-sizing:border-box;margin-bottom:.6em}
-  button{padding:.7em 1.4em;font-size:1.1em}
-  small{color:#666} #status{min-height:1.4em}
+  :root{
+    color-scheme: light dark;
+    --bg:#f5f6f8; --card:#fff; --text:#1b1f24; --muted:#667085; --border:#d0d5dd;
+    --accent:#2563eb; --accent-text:#fff; --ok:#16a34a; --off:#98a2b3; --err:#d92d20;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f1115; --card:#181b21; --text:#e6e8eb; --muted:#9aa3af; --border:#323843;
+      --accent:#3b82f6; --accent-text:#fff; --ok:#4ade80; --off:#6b7280; --err:#f87171;
+    }
+  }
+  *{box-sizing:border-box}
+  body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:1em}
+  main{max-width:480px;margin:1em auto;background:var(--card);border:1px solid var(--border);
+       border-radius:14px;padding:1.2em}
+  h2{margin:0}
+  header{display:flex;justify-content:space-between;align-items:center;gap:.5em;margin-bottom:1em}
+  .pill{display:inline-flex;align-items:center;gap:.4em;font-size:.85em;color:var(--muted);
+        border:1px solid var(--border);border-radius:99px;padding:.25em .7em;white-space:nowrap}
+  .dot{width:.6em;height:.6em;border-radius:50%;background:var(--off)}
+  .pill.on .dot{background:var(--ok)} .pill.on{color:var(--text)}
+  label{display:block;font-size:.9em;color:var(--muted);margin:.9em 0 .3em}
+  input[type=text],input[type=password],select{
+    width:100%;padding:.7em;font-size:1.05em;color:var(--text);background:var(--bg);
+    border:1px solid var(--border);border-radius:8px}
+  input:focus,select:focus,button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .pw{position:relative}
+  .pw input{padding-right:2.8em}
+  .eye{position:absolute;right:.3em;top:50%;transform:translateY(-50%);background:none;border:0;
+       color:var(--muted);cursor:pointer;padding:.4em;display:flex;margin:0}
+  .eye svg{width:1.4em;height:1.4em}
+  .eye .off{display:none} .eye.shown .on{display:none} .eye.shown .off{display:block}
+  .row{display:flex;gap:.6em;align-items:center;flex-wrap:wrap}
+  input[type=color]{width:3em;height:2.6em;padding:.15em;border:1px solid var(--border);
+       border-radius:8px;background:var(--bg);cursor:pointer}
+  .sw{width:1.9em;height:1.9em;border-radius:50%;border:2px solid var(--border);cursor:pointer;padding:0;margin:0}
+  button.main{margin-top:1.1em;width:100%;padding:.75em;font-size:1.05em;border:0;border-radius:8px;
+       background:var(--accent);color:var(--accent-text);cursor:pointer}
+  button.link{background:none;border:0;color:var(--muted);text-decoration:underline;cursor:pointer;
+       font-size:.85em;padding:0}
+  #status{min-height:1.4em;margin:.8em 0 0;color:var(--muted)} #status.err{color:var(--err)}
+  .now{margin-top:1em;padding:.8em;border-radius:8px;background:#000;color:#00c8ff;
+       font-family:monospace;font-size:1.1em;word-break:break-word}
+  small{color:var(--muted)} [hidden]{display:none!important}
 </style></head><body>
-<h2>LED Matrix</h2>
-<form id="f">
-  <input id="text" type="text" maxlength="100" placeholder="Type something..." autofocus required>
-  <input id="pw" type="password" placeholder="Password" autocomplete="current-password" required>
-  <button type="submit">Show on matrix</button>
-</form>
-<p id="status"></p>
-<p>Now showing: <b id="now">...</b></p>
-<small>Long text scrolls and loops. Letters, numbers and basic symbols only. The matrix updates within a few seconds.</small>
+<main>
+  <header>
+    <h2>LED Matrix</h2>
+    <span id="device" class="pill"><span class="dot"></span><span id="deviceText">Checking...</span></span>
+  </header>
+
+  <!-- Login (shown only until you sign in once on this browser) -->
+  <form id="login" hidden>
+    <label for="pw">Password</label>
+    <div class="pw">
+      <input id="pw" type="password" autocomplete="current-password" required>
+      <button type="button" class="eye" id="eye" aria-label="Show password" title="Show password">
+        <svg class="on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>
+        <svg class="off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.9 10.9 0 0 1 12 19c-7 0-11-7-11-7a19.8 19.8 0 0 1 5.06-5.94M9.9 4.24A10.9 10.9 0 0 1 12 4c7 0 11 7 11 7a19.9 19.9 0 0 1-3.17 4.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>
+      </button>
+    </div>
+    <button class="main" type="submit">Sign in</button>
+  </form>
+
+  <!-- Sender (shown once signed in) -->
+  <form id="send" hidden>
+    <label for="text">Message</label>
+    <input id="text" type="text" maxlength="100" placeholder="Type something..." required>
+
+    <label>Colour</label>
+    <div class="row" id="swatches">
+      <input id="color" type="color" value="#00c8ff" aria-label="Custom colour">
+    </div>
+
+    <label for="song">Sound when it arrives</label>
+    <select id="song">
+      <option value="0">None</option>
+      <option value="1" selected>Beep</option>
+      <option value="2">Ding-dong</option>
+      <option value="3">Twinkle Twinkle</option>
+      <option value="4">Ode to Joy</option>
+      <option value="5">Happy Birthday</option>
+    </select>
+
+    <button class="main" type="submit">Show on matrix</button>
+    <p style="margin:.8em 0 0;text-align:right"><button type="button" class="link" id="logout">Sign out</button></p>
+  </form>
+
+  <p id="status" role="status"></p>
+  <div class="now" id="now" hidden></div>
+  <p><small>Long text scrolls and loops. Letters, numbers and basic symbols only. The matrix updates within ~10 seconds.</small></p>
+</main>
 <script>
 const $ = id => document.getElementById(id);
-$('pw').value = localStorage.getItem('pw') || '';
-async function refresh() {
-  try { $('now').textContent = (await (await fetch('/api/message')).json()).text || '(nothing yet)'; } catch (e) {}
-}
-$('f').addEventListener('submit', async e => {
-  e.preventDefault();
-  $('status').textContent = 'Sending...';
-  const r = await fetch('/api/message', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text: $('text').value, password: $('pw').value})
-  });
-  const j = await r.json();
-  if (r.ok) {
-    localStorage.setItem('pw', $('pw').value);
-    $('text').value = '';
-    $('status').textContent = 'Sent!';
-    refresh();
-  } else {
-    $('status').textContent = j.error || 'Failed';
-  }
+const PRESETS = ['#00c8ff','#ff3b30','#34c759','#ffcc00','#af52de','#ffffff'];
+
+PRESETS.forEach(c => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.className = 'sw'; b.style.background = c; b.title = c;
+  b.addEventListener('click', () => { $('color').value = c; });
+  $('swatches').insertBefore(b, $('color'));
 });
-refresh();
+
+function setStatus(msg, err) { $('status').textContent = msg || ''; $('status').className = err ? 'err' : ''; }
+function showApp(loggedIn) { $('login').hidden = loggedIn; $('send').hidden = !loggedIn; if (!loggedIn) $('pw').focus(); }
+
+$('eye').addEventListener('click', () => {
+  const show = $('pw').type === 'password';
+  $('pw').type = show ? 'text' : 'password';
+  $('eye').classList.toggle('shown', show);
+  const l = show ? 'Hide password' : 'Show password';
+  $('eye').setAttribute('aria-label', l); $('eye').title = l;
+});
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method, credentials: 'same-origin',
+    headers: body ? {'Content-Type': 'application/json'} : undefined,
+    body: body ? JSON.stringify(body) : undefined
+  });
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  return {ok: r.ok, status: r.status, data: j};
+}
+
+async function refresh() {
+  try {
+    const {data: m} = await api('GET', '/api/message');
+    const d = m.device || {};
+    const pill = $('device');
+    pill.classList.toggle('on', !!d.online);
+    $('deviceText').textContent = d.online ? 'Device online'
+      : d.lastSeenAgoSec == null ? 'Device offline'
+      : 'Offline · seen ' + ago(d.lastSeenAgoSec);
+    if (m.text) {
+      $('now').hidden = false; $('now').textContent = m.text; $('now').style.color = m.color || '#00c8ff';
+    }
+  } catch (e) {}
+}
+function ago(s) { return s < 90 ? s + 's ago' : s < 5400 ? Math.round(s/60) + ' min ago' : Math.round(s/3600) + ' h ago'; }
+
+$('login').addEventListener('submit', async e => {
+  e.preventDefault(); setStatus('Signing in...');
+  const r = await api('POST', '/api/auth', {password: $('pw').value});
+  $('pw').value = '';
+  if (r.ok) { setStatus(''); showApp(true); $('text').focus(); } else setStatus(r.data.error || 'Failed', true);
+});
+
+$('logout').addEventListener('click', async () => { await api('DELETE', '/api/auth'); setStatus(''); showApp(false); });
+
+$('send').addEventListener('submit', async e => {
+  e.preventDefault(); setStatus('Sending...');
+  const r = await api('POST', '/api/message', {
+    text: $('text').value, color: $('color').value, song: Number($('song').value)
+  });
+  if (r.ok) { $('text').value = ''; setStatus('Sent!'); refresh(); }
+  else if (r.status === 401) { setStatus('Please sign in again.', true); showApp(false); }
+  else setStatus(r.data.error || 'Failed', true);
+});
+
+(async () => {
+  try { showApp((await api('GET', '/api/auth')).data.ok === true); } catch (e) { showApp(false); }
+  refresh(); setInterval(refresh, 5000);
+})();
 </script>
 </body></html>
