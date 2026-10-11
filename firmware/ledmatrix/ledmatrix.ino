@@ -10,6 +10,14 @@
 const char* WIFI_SSID     = "YOUR_WIFI_NAME";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 const char* HOSTNAME      = "ledmatrix";
+
+// Fixed LAN address, so the router's port forward always points at the ESP32.
+// Pick a free address on your network, outside your router's DHCP range.
+#define USE_STATIC_IP 1               // 0 = get an address from the router (DHCP)
+const IPAddress STATIC_IP (192, 168, 1, 50);
+const IPAddress GATEWAY   (192, 168, 1, 1);     // your router
+const IPAddress SUBNET    (255, 255, 255, 0);
+const IPAddress DNS_SERVER(8, 8, 8, 8);
 const int   TCP_PORT      = 8443;            // forward this port on your router to the ESP32
 // 64 hex characters (32 bytes). Make one with:  openssl rand -hex 32
 // Must be identical to DEVICE_KEY on Vercel. It both authenticates and encrypts.
@@ -288,6 +296,9 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
   WiFi.setAutoReconnect(true);
+#if USE_STATIC_IP
+  if (!WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS_SERVER)) Serial.println("Static IP config failed");
+#endif
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   if (!parseKey()) {
