@@ -303,7 +303,7 @@ void setup() {
 
   if (!parseKey()) {
     Serial.println("DEVICE_KEY must be exactly 64 hex characters");
-    setText("BAD KEY", matrix.Color(255, 0, 0));
+    setText("KEY?", matrix.Color(255, 0, 0));   // short so it fits without scrolling
     while (true) delay(1000);
   }
 }
