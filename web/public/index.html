@@ -53,7 +53,7 @@
 <main>
   <header>
     <h2>LED Matrix</h2>
-    <span id="device" class="pill"><span class="dot"></span><span id="deviceText">Checking...</span></span>
+    <span id="device" class="pill" hidden><span class="dot"></span><span id="deviceText">Checking...</span></span>
   </header>
 
   <!-- Login (shown only until you sign in once on this browser) -->
@@ -95,7 +95,7 @@
 
   <p id="status" role="status"></p>
   <div class="now" id="now" hidden></div>
-  <p><small>Long text scrolls and loops. Letters, numbers and basic symbols only. The matrix updates within ~10 seconds.</small></p>
+  <p><small>Long text scrolls and loops. Letters, numbers and basic symbols only.</small></p>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -109,7 +109,10 @@ PRESETS.forEach(c => {
 });
 
 function setStatus(msg, err) { $('status').textContent = msg || ''; $('status').className = err ? 'err' : ''; }
-function showApp(loggedIn) { $('login').hidden = loggedIn; $('send').hidden = !loggedIn; if (!loggedIn) $('pw').focus(); }
+function showApp(loggedIn) {
+  $('login').hidden = loggedIn; $('send').hidden = !loggedIn; $('device').hidden = !loggedIn;
+  if (loggedIn) startPolling(); else { clearInterval(timer); $('now').hidden = true; $('pw').focus(); }
+}
 
 $('eye').addEventListener('click', () => {
   const show = $('pw').type === 'password';
@@ -129,21 +132,21 @@ async function api(method, path, body) {
   return {ok: r.ok, status: r.status, data: j};
 }
 
+let timer = null;
 async function refresh() {
+  if (document.hidden || $('send').hidden) return;
   try {
-    const {data: m} = await api('GET', '/api/message');
-    const d = m.device || {};
-    const pill = $('device');
-    pill.classList.toggle('on', !!d.online);
-    $('deviceText').textContent = d.online ? 'Device online'
-      : d.lastSeenAgoSec == null ? 'Device offline'
-      : 'Offline · seen ' + ago(d.lastSeenAgoSec);
-    if (m.text) {
-      $('now').hidden = false; $('now').textContent = m.text; $('now').style.color = m.color || '#00c8ff';
-    }
+    const {status, data: m} = await api('GET', '/api/status');
+    if (status === 401) { showApp(false); return; }
+    $('device').classList.toggle('on', !!m.online);
+    $('deviceText').textContent = m.online ? 'Device online' : 'Device offline';
+    $('device').title = m.online ? '' : (m.reason || '');
+    if (m.online && m.text) showNow(m.text, m.color);
   } catch (e) {}
 }
-function ago(s) { return s < 90 ? s + 's ago' : s < 5400 ? Math.round(s/60) + ' min ago' : Math.round(s/3600) + ' h ago'; }
+function showNow(text, color) { $('now').hidden = false; $('now').textContent = text; $('now').style.color = color || '#00c8ff'; }
+function startPolling() { clearInterval(timer); refresh(); timer = setInterval(refresh, 15000); }
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 
 $('login').addEventListener('submit', async e => {
   e.preventDefault(); setStatus('Signing in...');
@@ -159,14 +162,13 @@ $('send').addEventListener('submit', async e => {
   const r = await api('POST', '/api/message', {
     text: $('text').value, color: $('color').value, song: Number($('song').value)
   });
-  if (r.ok) { $('text').value = ''; setStatus('Sent!'); refresh(); }
+  if (r.ok) { $('text').value = ''; setStatus('Sent!'); showNow(r.data.text, r.data.color); }
   else if (r.status === 401) { setStatus('Please sign in again.', true); showApp(false); }
   else setStatus(r.data.error || 'Failed', true);
 });
 
 (async () => {
   try { showApp((await api('GET', '/api/auth')).data.ok === true); } catch (e) { showApp(false); }
-  refresh(); setInterval(refresh, 5000);
 })();
 </script>
 </body></html>

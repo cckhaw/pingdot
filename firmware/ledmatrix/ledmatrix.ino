@@ -1,16 +1,23 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
+#include <HTTPSServer.hpp>      // library: "ESP32 HTTPS Server" by Frank Hessel
+#include <SSLCert.hpp>
+#include <HTTPRequest.hpp>
+#include <HTTPResponse.hpp>
+#include <ResourceNode.hpp>
 #include <Adafruit_GFX.h>
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
+#include "cert.h"                // made by tools/gen-cert.sh (certificate + private key)
+
+using namespace httpsserver;
 
 // ---------- CHANGE THESE ----------
 const char* WIFI_SSID     = "YOUR_WIFI_NAME";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 const char* HOSTNAME      = "ledmatrix";
-const char* MESSAGE_URL   = "https://YOUR-APP.vercel.app/api/latest";
+const int   HTTPS_PORT    = 8443;            // forward this port on your router to the ESP32
+const char* DEVICE_SECRET = "CHANGE-ME-LONG-RANDOM-STRING";   // must equal DEVICE_SECRET on Vercel
 // ----------------------------------
 
 #define LED_PIN       16
@@ -18,11 +25,6 @@ const char* MESSAGE_URL   = "https://YOUR-APP.vercel.app/api/latest";
 #define USE_BUZZER    1      // 1 = play sounds when new text arrives, 0 = silent
 #define MATRIX_W      32     // two 16x16 panels side by side
 #define MAX_TEXT_LEN  100
-
-// Website is polled every POLL_INTERVAL ms; every HEARTBEAT_EVERY-th poll also
-// tells the site "I'm online" (keeps the free Redis command count low).
-const unsigned long POLL_INTERVAL = 8000;
-const int HEARTBEAT_EVERY = 4;
 
 Adafruit_NeoMatrix matrix = Adafruit_NeoMatrix(
   16, 16, 2, 1, LED_PIN,
@@ -40,11 +42,13 @@ bool scrolling = false;
 unsigned long lastScroll = 0;
 const int scrollInterval = 60;   // ms per pixel step (lower = faster)
 bool wasConnected = false;
-unsigned long lastPoll = 0;
-bool polledOnce = false;
-int pollCount = 0;
-String lastId = "";
-bool firstFetchDone = false;
+bool serverStarted = false;
+String currentColorHex = "00c8ff";
+int authFailures = 0;
+unsigned long lockedUntil = 0;
+
+SSLCert cert = SSLCert(cert_der, cert_der_len, key_der, key_der_len);
+HTTPSServer secureServer = HTTPSServer(&cert, HTTPS_PORT, 2);   // max 2 connections
 
 // ---------- Songs (non-blocking; order must match the website's dropdown) ----------
 
@@ -146,43 +150,68 @@ void updateScrolling() {
   }
 }
 
-// ---------- Fetch from website ----------
+// ---------- Incoming requests (HTTPS, from the Vercel site) ----------
 
-// Endpoint returns "<id>\n<RRGGBB>\n<song>\n<text>". Shows it when the id changes.
-void pollMessage() {
-  String url = MESSAGE_URL;
-  if (pollCount % HEARTBEAT_EVERY == 0) url += "?hb=1";
-  pollCount++;
+bool secretMatches(const std::string& given) {
+  size_t n = strlen(DEVICE_SECRET);
+  uint8_t diff = (given.size() != n);
+  for (size_t i = 0; i < n; i++) diff |= (i < given.size() ? given[i] : 0) ^ DEVICE_SECRET[i];
+  return diff == 0;
+}
 
-  WiFiClientSecure client;
-  client.setInsecure();          // skips certificate check; fine for a public read-only message
-  HTTPClient http;
-  http.setTimeout(4000);
-  if (!http.begin(client, url)) return;
-
-  int code = http.GET();
-  if (code == 200) {
-    String body = http.getString();
-    int a = body.indexOf('\n');
-    int b = body.indexOf('\n', a + 1);
-    int c = body.indexOf('\n', b + 1);
-    if (a > 0 && b > a && c > b) {
-      String id    = body.substring(0, a);
-      String hex   = body.substring(a + 1, b);
-      int    song  = body.substring(b + 1, c).toInt();
-      String text  = body.substring(c + 1);
-      if (id != lastId && id != "0") {
-        long rgb = strtol(hex.c_str(), nullptr, 16);
-        uint16_t color = matrix.Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
-        if (setText(text, color) && firstFetchDone) startSong(song);   // no sound for the message already there at boot
-        lastId = id;
-      }
-    }
-    firstFetchDone = true;
-  } else {
-    Serial.printf("Fetch failed: %d\n", code);
+// Checks the X-Auth header. 5 wrong tries in a row lock requests out for a minute.
+bool authorized(HTTPRequest* req, HTTPResponse* res) {
+  if (millis() < lockedUntil) {
+    res->setStatusCode(429);
+    res->print("locked");
+    return false;
   }
-  http.end();
+  if (!secretMatches(req->getHeader("X-Auth"))) {
+    if (++authFailures >= 5) { lockedUntil = millis() + 60000; authFailures = 0; }
+    res->setStatusCode(401);
+    res->print("unauthorized");
+    return false;
+  }
+  authFailures = 0;
+  return true;
+}
+
+// POST /message, body "<RRGGBB>\n<song>\n<text>"
+void handleMessage(HTTPRequest* req, HTTPResponse* res) {
+  if (!authorized(req, res)) return;
+
+  char buf[256];
+  size_t len = 0;
+  while (!req->requestComplete() && len < sizeof(buf) - 1) {
+    len += req->readBytes((byte*)buf + len, sizeof(buf) - 1 - len);
+  }
+  if (!req->requestComplete()) { res->setStatusCode(413); res->print("too big"); return; }
+  buf[len] = 0;
+
+  String body(buf);
+  int a = body.indexOf('\n');
+  int b = body.indexOf('\n', a + 1);
+  if (a != 6 || b < 0) { res->setStatusCode(400); res->print("bad format"); return; }
+
+  String hex  = body.substring(0, a);
+  int    song = body.substring(a + 1, b).toInt();
+  String text = body.substring(b + 1);
+
+  long rgb = strtol(hex.c_str(), nullptr, 16);
+  uint16_t color = matrix.Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+  if (!setText(text, color)) { res->setStatusCode(400); res->print("empty text"); return; }
+  currentColorHex = hex;
+  startSong(song);
+  res->print("ok");
+}
+
+// GET /status -> "<RRGGBB>\n<current text>"  (also how the site checks we're online)
+void handleStatus(HTTPRequest* req, HTTPResponse* res) {
+  if (!authorized(req, res)) return;
+  res->setHeader("Content-Type", "text/plain");
+  res->print(currentColorHex.c_str());
+  res->print("\n");
+  res->print(currentText.c_str());
 }
 
 // ---------- Setup / loop ----------
@@ -206,18 +235,19 @@ void loop() {
   bool connected = (WiFi.status() == WL_CONNECTED);
 
   if (connected && !wasConnected) {
-    Serial.println("Connected, IP " + WiFi.localIP().toString());
+    Serial.println("Connected, LAN IP " + WiFi.localIP().toString() + ", HTTPS port " + String(HTTPS_PORT));
     setText("Online", DEFAULT_COLOR());
-    polledOnce = false;          // fetch immediately
+    currentColorHex = "00c8ff";
+    if (!serverStarted) {        // start only once WiFi is up
+      secureServer.registerNode(new ResourceNode("/message", "POST", &handleMessage));
+      secureServer.registerNode(new ResourceNode("/status", "GET", &handleStatus));
+      secureServer.start();
+      serverStarted = true;
+    }
   }
   wasConnected = connected;
 
-  if (connected && (!polledOnce || millis() - lastPoll >= POLL_INTERVAL)) {
-    polledOnce = true;
-    lastPoll = millis();
-    pollMessage();
-  }
-
+  if (serverStarted) secureServer.loop();
   updateScrolling();
   updateSong();
 }
