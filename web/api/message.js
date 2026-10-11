@@ -1,30 +1,29 @@
-const crypto = require('crypto');
-const { getMessage, setMessage, clean } = require('./_store');
+const { callDevice, clean, cleanColor, cleanSong } = require('./_device');
+const { isAuthed } = require('./_auth');
 
-function passwordOk(given) {
-  const expected = process.env.SITE_PASSWORD || '';
-  if (!expected) return false;
-  const a = crypto.createHash('sha256').update(String(given || '')).digest();
-  const b = crypto.createHash('sha256').update(expected).digest();
-  return crypto.timingSafeEqual(a, b);
-}
-
+// POST {text, color, song}: log-in required; pushed straight to the ESP32 over an encrypted TCP socket.
 module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  try {
-    if (req.method === 'GET') {
-      return res.status(200).json(await getMessage());
-    }
-    if (req.method === 'POST') {
-      const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
-      if (!passwordOk(body.password)) return res.status(401).json({ error: 'Wrong password' });
-      const text = clean(body.text);
-      if (!text) return res.status(400).json({ error: 'Text is empty' });
-      return res.status(200).json(await setMessage(text));
-    }
-    res.setHeader('Allow', 'GET, POST');
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method not allowed' });
+  }
+  if (!isAuthed(req)) return res.status(401).json({ error: 'Not logged in' });
+
+  let body = req.body || {};
+  if (typeof body === 'string') {
+    try { body = JSON.parse(body); } catch (e) { body = {}; }
+  }
+  const text = clean(body.text);
+  if (!text) return res.status(400).json({ error: 'Text is empty' });
+  const color = cleanColor(body.color);
+  const song = cleanSong(body.song);
+
+  try {
+    const r = await callDevice(`M\n${color.slice(1)}\n${song}\n${text}`);
+    if (r === 'OK') return res.status(200).json({ ok: true, text, color, song });
+    return res.status(502).json({ error: 'Device refused the message' });
   } catch (e) {
-    return res.status(500).json({ error: 'Server error' });
+    return res.status(502).json({ error: e.message === 'Device is not configured' ? e.message : 'Device unreachable' });
   }
 };
