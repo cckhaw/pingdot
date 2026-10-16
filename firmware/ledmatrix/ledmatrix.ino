@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 #include <esp_random.h>
 #include <mbedtls/gcm.h>
 #include <Adafruit_GFX.h>
@@ -7,22 +10,19 @@
 #include <Adafruit_NeoPixel.h>
 
 // ---------- CHANGE THESE ----------
-const char* WIFI_SSID     = "YOUR_WIFI_NAME";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+// WiFi name, password and IP are NOT set here: they are entered on the ESP32's setup page
+// (see "Network setup" in the README) and stored on the board.
 const char* HOSTNAME      = "ledmatrix";
-
-// Fixed LAN address, so the router's port forward always points at the ESP32.
-// Pick a free address on your network, outside your router's DHCP range.
-#define USE_STATIC_IP 1               // 0 = get an address from the router (DHCP)
-const IPAddress STATIC_IP (192, 168, 1, 50);
-const IPAddress GATEWAY   (192, 168, 1, 1);     // your router
-const IPAddress SUBNET    (255, 255, 255, 0);
-const IPAddress DNS_SERVER(8, 8, 8, 8);
 const int   TCP_PORT      = 8443;            // forward this port on your router to the ESP32
 // 64 hex characters (32 bytes). Make one with:  openssl rand -hex 32
 // Must be identical to DEVICE_KEY on Vercel. It both authenticates and encrypts.
 const char* DEVICE_KEY    = "PASTE-64-HEX-CHARACTERS-HERE";
+// Setup hotspot, shown when the board has no WiFi settings yet or can't join (password: 8+ characters)
+const char* SETUP_AP_NAME     = "LEDMatrix-Setup";
+const char* SETUP_AP_PASSWORD = "ledmatrix";
 // ----------------------------------
+
+#define BOOT_PIN      0      // hold this button ~3s while running to reopen the setup page
 
 #define LED_PIN       16
 #define BUZZER_PIN    17
@@ -343,36 +343,244 @@ void serviceNetwork() {
   if (rxLen >= 2 + n) processFrame(rx + 2, n);
 }
 
+// ---------- Network setup (settings stored on the board, edited on a setup page) ----------
+
+struct NetConfig {
+  String ssid, pass;
+  bool dhcp;
+  String ip, gw, mask, dns;
+};
+NetConfig cfg;
+Preferences prefs;
+DNSServer dnsServer;
+WebServer web(80);
+bool portalActive = false;
+unsigned long portalStarted = 0;
+const unsigned long PORTAL_TIMEOUT = 600000;   // setup page closes after 10 min and the board retries its saved WiFi
+String scanOptions;                            // <option> list of nearby networks
+
+void loadConfig() {
+  prefs.begin("net", false);
+  cfg.ssid = prefs.getString("ssid", "");
+  cfg.pass = prefs.getString("pass", "");
+  cfg.dhcp = prefs.getBool("dhcp", true);
+  cfg.ip   = prefs.getString("ip", "192.168.1.50");
+  cfg.gw   = prefs.getString("gw", "192.168.1.1");
+  cfg.mask = prefs.getString("mask", "255.255.255.0");
+  cfg.dns  = prefs.getString("dns", "8.8.8.8");
+}
+
+String esc(const String& s) {
+  String o;
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if      (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '"') o += "&quot;";
+    else               o += c;
+  }
+  return o;
+}
+
+// Starts joining the saved network (fixed IP if configured).
+void beginJoin() {
+  WiFi.setHostname(HOSTNAME);
+  WiFi.setAutoReconnect(true);
+  if (!cfg.dhcp) {
+    IPAddress ip, gw, mask, d;
+    if (ip.fromString(cfg.ip) && gw.fromString(cfg.gw) && mask.fromString(cfg.mask) && d.fromString(cfg.dns)) {
+      if (!WiFi.config(ip, gw, mask, d)) Serial.println("Static IP config failed");
+    } else {
+      Serial.println("Saved fixed IP is invalid, using DHCP");
+    }
+  }
+  WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
+}
+
+void scanNetworks() {
+  int n = WiFi.scanNetworks();
+  scanOptions = "";
+  for (int i = 0; i < n && i < 20; i++) scanOptions += "<option value=\"" + esc(WiFi.SSID(i)) + "\">";
+  WiFi.scanDelete();
+}
+
+const char PAGE_HEAD[] PROGMEM = R"rawliteral(<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark"><title>LED Matrix setup</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:440px;margin:1.5em auto;padding:0 1em}
+  label{display:block;margin:.9em 0 .3em;font-size:.9em;color:#667}
+  input[type=text],input[type=password]{width:100%;padding:.65em;font-size:1.05em;box-sizing:border-box}
+  button{margin-top:1.2em;width:100%;padding:.75em;font-size:1.05em}
+  .row{display:flex;gap:1.2em} .row label{display:inline;margin:0;font-size:1em;color:inherit}
+  .msg{padding:.7em;border-radius:6px;background:#fde8e8;color:#8a1f1f} .ok{background:#e6f4ea;color:#14532d}
+  small,a{color:#667}
+</style></head><body><h2>LED Matrix setup</h2>)rawliteral";
+
+String pageForm(const String& err) {
+  String h = FPSTR(PAGE_HEAD);
+  if (err.length()) h += "<p class=\"msg\">" + esc(err) + "</p>";
+  h += "<form method=\"POST\" action=\"/save\">";
+  h += "<label>WiFi name</label><input type=\"text\" name=\"ssid\" list=\"nets\" maxlength=\"32\" required value=\"" + esc(cfg.ssid) + "\">";
+  h += "<datalist id=\"nets\">" + scanOptions + "</datalist>";
+  h += "<label>WiFi password</label><input type=\"password\" name=\"pass\" maxlength=\"63\" autocomplete=\"off\" placeholder=\"" +
+       String(cfg.ssid.length() ? "leave blank to keep the saved password" : "") + "\">";
+  h += "<label>IP address</label><div class=\"row\">";
+  h += "<span><input type=\"radio\" name=\"mode\" id=\"d\" value=\"dhcp\"" + String(cfg.dhcp ? " checked" : "") + "> <label for=\"d\">Automatic (DHCP)</label></span>";
+  h += "<span><input type=\"radio\" name=\"mode\" id=\"s\" value=\"static\"" + String(cfg.dhcp ? "" : " checked") + "> <label for=\"s\">Fixed</label></span></div>";
+  h += "<label>Fixed IP</label><input type=\"text\" name=\"ip\" value=\"" + esc(cfg.ip) + "\">";
+  h += "<label>Gateway (your router)</label><input type=\"text\" name=\"gw\" value=\"" + esc(cfg.gw) + "\">";
+  h += "<label>Subnet mask</label><input type=\"text\" name=\"mask\" value=\"" + esc(cfg.mask) + "\">";
+  h += "<label>DNS</label><input type=\"text\" name=\"dns\" value=\"" + esc(cfg.dns) + "\">";
+  h += "<button type=\"submit\">Save and restart</button></form>";
+  h += "<p><a href=\"/?rescan=1\">Rescan WiFi networks</a></p>";
+  h += "<p><small>Fixed IP: pick a free address on your network, outside your router's DHCP range. The three fixed-IP fields are ignored when Automatic is selected.</small></p>";
+  h += "</body></html>";
+  return h;
+}
+
+void handleRoot() {
+  if (web.hasArg("rescan") || scanOptions.length() == 0) scanNetworks();
+  web.send(200, "text/html", pageForm(""));
+}
+
+void handleSave() {
+  String ssid = web.arg("ssid"); ssid.trim();
+  String pass = web.arg("pass");
+  bool dhcp = web.arg("mode") != "static";
+  String ip = web.arg("ip"), gw = web.arg("gw"), mask = web.arg("mask"), d = web.arg("dns");
+  ip.trim(); gw.trim(); mask.trim(); d.trim();
+  if (d.length() == 0) d = gw;
+
+  String err;
+  IPAddress a;
+  if (ssid.length() == 0 || ssid.length() > 32) err = "Enter the WiFi name (up to 32 characters).";
+  else if (pass.length() > 0 && (pass.length() < 8 || pass.length() > 63)) err = "WiFi password must be 8-63 characters.";
+  else if (!dhcp && !(a.fromString(ip) && a.fromString(gw) && a.fromString(mask) && a.fromString(d)))
+    err = "Fixed IP, gateway, subnet mask and DNS must be valid addresses like 192.168.1.50.";
+  if (err.length()) {
+    cfg.ssid = ssid; cfg.dhcp = dhcp;                           // keep what was typed
+    if (ip.length()) cfg.ip = ip;
+    if (gw.length()) cfg.gw = gw;
+    if (mask.length()) cfg.mask = mask;
+    if (d.length()) cfg.dns = d;
+    web.send(400, "text/html", pageForm(err));
+    return;
+  }
+
+  if (pass.length() == 0 && ssid == cfg.ssid) pass = cfg.pass;  // blank = keep the saved password
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.putBool("dhcp", dhcp);
+  if (!dhcp) {                                                  // keep the old fixed-IP values when switching to DHCP
+    prefs.putString("ip", ip);
+    prefs.putString("gw", gw);
+    prefs.putString("mask", mask);
+    prefs.putString("dns", d);
+  }
+
+  String h = FPSTR(PAGE_HEAD);
+  h += "<p class=\"msg ok\">Saved. The board is restarting and will join <b>" + esc(ssid) + "</b>. You can close this page.</p></body></html>";
+  web.send(200, "text/html", h);
+  delay(1000);
+  ESP.restart();
+}
+
+// Hotspot + setup page. alsoJoin = keep trying the saved network in the background (used when joining failed).
+void startPortal(bool alsoJoin) {
+  portalActive = true;
+  portalStarted = millis();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.disconnect();
+  WiFi.softAP(SETUP_AP_NAME, SETUP_AP_PASSWORD);
+  delay(200);
+  scanNetworks();
+  if (alsoJoin) beginJoin();
+  dnsServer.start(53, "*", WiFi.softAPIP());                    // phones open the page automatically
+  web.on("/", HTTP_GET, handleRoot);
+  web.on("/save", HTTP_POST, handleSave);
+  web.onNotFound([]() {
+    web.sendHeader("Location", "http://192.168.4.1/");
+    web.send(302);
+  });
+  web.begin();
+  Serial.println("Setup mode: join WiFi '" + String(SETUP_AP_NAME) + "' and open http://192.168.4.1");
+  setText("Setup: join WiFi " + String(SETUP_AP_NAME) + ", password " + SETUP_AP_PASSWORD + ", open 192.168.4.1",
+          matrix.Color(255, 140, 0));
+}
+
+void stopPortal() {
+  dnsServer.stop();
+  web.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  portalActive = false;
+}
+
+// Hold the BOOT button ~3s while the sketch is running to reopen the setup page.
+void checkBootButton() {
+  static unsigned long since = 0;
+  if (digitalRead(BOOT_PIN) == LOW) {
+    if (since == 0) since = millis();
+    else if (millis() - since > 3000) {
+      setText("SETUP", matrix.Color(255, 140, 0));
+      prefs.putBool("force", true);
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    since = 0;
+  }
+}
+
 // ---------- Setup / loop ----------
 
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BOOT_PIN, INPUT_PULLUP);
 
   matrix.begin();
   matrix.setTextWrap(false);
   matrix.setBrightness(5);      // keep low; use an external 5V supply for more
-  setText("WiFi...", DEFAULT_COLOR());
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(HOSTNAME);
-  WiFi.setAutoReconnect(true);
-#if USE_STATIC_IP
-  if (!WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS_SERVER)) Serial.println("Static IP config failed");
-#endif
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   if (!parseKey()) {
     Serial.println("DEVICE_KEY must be exactly 64 hex characters");
     setText("KEY?", matrix.Color(255, 0, 0));   // short so it fits without scrolling
     while (true) delay(1000);
   }
+
+  setText("WiFi...", DEFAULT_COLOR());
+  loadConfig();
+  bool force = prefs.getBool("force", false);
+  if (force) prefs.putBool("force", false);
+
+  if (cfg.ssid.length() == 0 || force) {        // nothing saved yet, or setup requested
+    startPortal(false);
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  beginJoin();
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(100);
+  if (WiFi.status() != WL_CONNECTED) startPortal(true);   // can't join: open setup page, keep retrying meanwhile
 }
 
 void loop() {
+  checkBootButton();
+  if (portalActive) {
+    dnsServer.processNextRequest();
+    web.handleClient();
+    if (WiFi.status() != WL_CONNECTED && millis() - portalStarted > PORTAL_TIMEOUT) ESP.restart();
+  }
+
   bool connected = (WiFi.status() == WL_CONNECTED);
 
   if (connected && !wasConnected) {
+    if (portalActive) stopPortal();             // joined after all: close the setup hotspot
     Serial.println("Connected, LAN IP " + WiFi.localIP().toString() + ", port " + String(TCP_PORT));
     setText("Online", DEFAULT_COLOR());
     currentColorHex = "00c8ff";
